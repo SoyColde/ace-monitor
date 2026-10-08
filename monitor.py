@@ -1,3 +1,4 @@
+import hashlib
 import os
 import sqlite3
 import sys
@@ -55,11 +56,6 @@ def fetch_jobs(token):
     return r.json()
 
 
-def job_id(job):
-    # Combina ambos campos para evitar repetidos
-    return f"{job.get('subCode')}|{job.get('workPlaceItemID')}"
-
-
 def get_db():
     con = sqlite3.connect(DB_FILE)
     con.execute(
@@ -70,18 +66,37 @@ def get_db():
     return con
 
 
+def fingerprints(j):
+    """Identifica una plaza por su contenido y por workPlaceItemID (no por subCode)."""
+    def n(x):
+        return str(x if x is not None else "").strip().lower()
+
+    campos = ("companyName", "positionName", "state", "city",
+              "paymentByHour", "paymentByHourExtra",
+              "dateBegin", "dateEnd", "housingIsIncluded")
+    fp = hashlib.sha1("|".join(n(j.get(c)) for c in campos).encode()).hexdigest()
+    keys = ["fp:" + fp]
+    if j.get("workPlaceItemID") is not None:
+        keys.append("wp:" + str(j["workPlaceItemID"]))
+    return keys
+
+
 def find_new(con, jobs):
-    """Devuelve las plazas que no estaban guardadas y las guarda."""
+    """Devuelve las plazas nuevas: no coincide ni el contenido ni el workPlaceItemID."""
     new = []
     for j in jobs:
-        jid = job_id(j)
-        exists = con.execute("SELECT 1 FROM seen_jobs WHERE id=?", (jid,)).fetchone()
-        if not exists:
-            con.execute(
-                "INSERT INTO seen_jobs VALUES (?,?,datetime('now'))",
-                (jid, j.get("positionName")),
-            )
+        keys = fingerprints(j)
+        marcas = ",".join("?" * len(keys))
+        vista = con.execute(
+            f"SELECT 1 FROM seen_jobs WHERE id IN ({marcas})", keys
+        ).fetchone()
+        if not vista:
             new.append(j)
+        for k in keys:
+            con.execute(
+                "INSERT OR IGNORE INTO seen_jobs VALUES (?,?,datetime('now'))",
+                (k, j.get("positionName")),
+            )
     con.commit()
     return new
 
@@ -122,7 +137,9 @@ def set_fails(con, n):
 def main():
     con = get_db()
     try:
-        first_run = con.execute("SELECT COUNT(*) FROM seen_jobs").fetchone()[0] == 0
+        first_run = con.execute(
+            "SELECT COUNT(*) FROM seen_jobs WHERE id LIKE 'fp:%'"
+        ).fetchone()[0] == 0
         token = login()
         jobs = fetch_jobs(token)
         new = find_new(con, jobs)
